@@ -68,6 +68,32 @@ user picks “yes and do not ask again.”"
   :type 'boolean
   :group 'aider)
 
+(defcustom aider-use-fuzzy-file-completion t
+  "When non-nil, use fuzzy search for file selection in Aider commands.
+If ivy or helm is available, it will be used for fuzzy matching.
+Otherwise, falls back to basic completion."
+  :type 'boolean
+  :group 'aider)
+
+(defcustom aider-file-completion-ignored-patterns
+  '(".git/" ".svn/" "node_modules/" "__pycache__/" "*.egg-info/"
+    "build/" "dist/" ".DS_Store" "*.class" "*.o" "*.so" "*.dll" "*.exe")
+  "List of gitignore-style patterns to ignore during file completion."
+  :type '(repeat string)
+  :group 'aider)
+
+(defcustom aider-max-project-files 10000
+  "Maximum number of files to process for project file completion.
+Set to nil to disable the limit. Large repositories may cause performance issues."
+  :type '(choice (const :tag "No limit" nil)
+                 (integer :tag "Maximum files" 10000))
+  :group 'aider)
+
+(defcustom aider-show-file-count-warning t
+  "When non-nil, show warning when project has many files."
+  :type 'boolean
+  :group 'aider)
+
 (defvar aider--switch-to-buffer-other-frame nil
   "Boolean controlling Aider buffer display behavior.
 When non-nil, open Aider buffer in a new frame.
@@ -92,19 +118,200 @@ Nil when not navigating history.")
     map)
   "Keymap for `aider-comint-mode'.")
 
+(defvar aider--cache-dir (expand-file-name ".aider-cache" user-emacs-directory)
+  "Directory for storing project-specific cache files.")
+
 (eval-after-load 'evil
   '(evil-define-key* 'normal aider-comint-mode-map (kbd "SPC") #'aider-core-insert-prompt))
 
+(defun aider-core--cleanup-old-cache-files ()
+  "Remove cache files older than 7 days."
+  (when (file-directory-p aider--cache-dir)
+    (condition-case err
+        (let* ((now (current-time))
+               (seven-days-ago (time-subtract now (days-to-time 7))))
+          (dolist (cache-file (directory-files aider--cache-dir t "\\.cache$"))
+            (when (and (file-regular-p cache-file)
+                       (time-less-p (file-attribute-modification-time (file-attributes cache-file))
+                                    seven-days-ago))
+              (delete-file cache-file))))
+      (error
+       (message "Error cleaning up old cache files: %s" (error-message-string err))
+       nil))))
+
+(defun aider--get-cache-file-path (git-root)
+  "Generate cache file path for GIT-ROOT.
+Creates a unique filename based on the git root path."
+  (when git-root
+    (let* ((safe-name (replace-regexp-in-string "[^a-zA-Z0-9-]" "_" git-root))
+           (hash-name (substring (secure-hash 'sha1 git-root) 0 8))
+           (cache-file (expand-file-name (concat "project-files-" safe-name "-" hash-name ".cache") aider--cache-dir)))
+      cache-file)))
+
+(defun aider--ensure-cache-dir ()
+  "Ensure the cache directory exists."
+  (unless (file-directory-p aider--cache-dir)
+    (make-directory aider--cache-dir t)))
+
+(defun aider--read-cache-file (cache-file)
+  "Read cached project files from CACHE-FILE.
+Returns nil if file doesn't exist or is older than 5 minutes."
+  (when (and cache-file (file-exists-p cache-file))
+    (let ((file-age (time-to-seconds (time-subtract (current-time) (file-attribute-modification-time (file-attributes cache-file))))))
+      (when (< file-age 300) ; Cache is valid for 5 minutes
+        (condition-case err
+            (with-temp-buffer
+              (insert-file-contents cache-file)
+              (read (current-buffer)))
+          (error
+           (message "Error reading cache file %s: %s" cache-file (error-message-string err))
+           nil))))))
+
+(defun aider--write-cache-file (cache-file files)
+  "Write FILES list to CACHE-FILE."
+  (when cache-file
+    (aider--ensure-cache-dir)
+    (condition-case err
+        (with-temp-buffer
+          (prin1 files (current-buffer))
+          (write-region (point-min) (point-max) cache-file))
+      (error
+       (message "Error writing cache file %s: %s" cache-file (error-message-string err))
+       nil))))
+
+(defun aider-get-project-files ()
+  "Get all files in the current git repository, excluding ignored patterns.
+Uses project-specific cache files for performance.
+Delegates file listing and ignoring to git for performance."
+  (let* ((git-root (magit-toplevel)))
+    (if git-root
+        (let* ((cache-file (aider--get-cache-file-path git-root))
+               (cached-files (aider--read-cache-file cache-file)))
+          (if cached-files
+              cached-files
+            (condition-case err
+                (let* ((base-cmd `("git" "-C" ,git-root "ls-files" "--cached" "--others" "--exclude-standard"))
+                       (exclude-args (mapcan (lambda (p) (list "--exclude" p))
+                                             aider-file-completion-ignored-patterns))
+                       (cmd (append base-cmd exclude-args))
+                       (all-files (apply #'process-lines cmd))
+                       (file-count (length all-files)))
+                  ;; Check file count limit
+                  (when (and aider-max-project-files (> file-count aider-max-project-files))
+                    (if aider-show-file-count-warning
+                        (message "Large repository detected: %d files. Consider setting `aider-max-project-files` to nil to disable this limit." file-count)
+                      (message "Large repository: %d files. Using first %d files." file-count aider-max-project-files))
+                    (when aider-max-project-files
+                      (setq all-files (cl-subseq all-files 0 aider-max-project-files))))
+                  (aider--write-cache-file cache-file all-files)
+                  all-files)
+              (error
+               (message "Error getting project files: %s" (error-message-string err))
+               nil))))
+      ;; No git root found, return nil
+      (message "Not in a git repository")
+      nil)))
+
+(defvar aider--project-files-cache nil
+  "In-memory cache for project files.
+This is a buffer-local variable.")
+(defvar aider--project-files-cache-time nil
+  "Timestamp for the in-memory project files cache.
+This is a buffer-local variable.")
+
+(defun aider--get-cached-project-files (&optional force-refresh)
+  "Get project files, using a buffer-local in-memory cache.
+The cache expires after 60 seconds.
+If FORCE-REFRESH is non-nil, refresh the cache."
+  (if (and (not force-refresh)
+           aider--project-files-cache
+           aider--project-files-cache-time
+           (< (time-to-seconds (time-subtract (current-time) aider--project-files-cache-time)) 60))
+      aider--project-files-cache
+    (let ((files (aider-get-project-files)))
+      (setq aider--project-files-cache files
+            aider--project-files-cache-time (current-time))
+      files)))
+
+(defun aider-fuzzy-select-file (prompt &optional git-root)
+  "Fuzzy select a file from the project using available completion frameworks.
+PROMPT is the prompt string. GIT-ROOT is the git repository root.
+Handles large file lists efficiently and provides user feedback."
+  (let* ((git-root (or git-root (magit-toplevel)))
+         (files (when git-root (aider--get-cached-project-files)))
+         (default-directory git-root))
+    (cond
+     ((null files)
+      (message "No files available for completion")
+      nil)
+     ;; Use ivy if available
+     ((and (featurep 'ivy) aider-use-fuzzy-file-completion)
+      (let ((file-count (length files)))
+        (when (> file-count 1000)
+          (message "Loading %d files for fuzzy selection..." file-count))
+        (ivy-read prompt files
+                  :require-match t
+                  :sort t
+                  :caller 'aider-fuzzy-select-file)))
+     ;; Use helm if available
+     ((and (featurep 'helm) aider-use-fuzzy-file-completion)
+      (let ((file-count (length files)))
+        (when (> file-count 1000)
+          (message "Loading %d files for fuzzy selection..." file-count))
+        (helm :sources (helm-build-sync-source prompt
+                                               :candidates files
+                                               :fuzzy-match t)
+              :buffer "*aider file selection*"
+              :prompt prompt)))
+     ;; Fallback to basic completion
+     (files
+      (let* ((file-count (length files))
+             (completion-ignore-case t))
+        (when (> file-count 1000)
+          (message "Loading %d files for completion..." file-count))
+        (let ((file (completing-read prompt files nil t)))
+          (when (member file files) file))))
+     ;; Ultimate fallback to read-file-name
+     (t
+      (read-file-name prompt git-root nil t)))))
+
 ;;;###autoload
 (defun aider-prompt-insert-add-file-path ()
-  "Select and insert the relative file path to git repository root."
+  "Select and insert the relative file path to git repository root.
+Uses fuzzy search if available and enabled."
   (interactive)
   (let* ((git-root (magit-toplevel))
-         (file (read-file-name "Select file: " git-root nil t)))
+         (file (aider-fuzzy-select-file "Select file: " git-root)))
     (if (and file (file-exists-p file))
         (let ((relative-path (if git-root
-                                (file-relative-name file git-root)
-                              file)))
+                                 (file-relative-name file git-root)
+                               file)))
+          (insert relative-path))
+      (message "No valid file selected."))))
+
+;;;###autoload
+(defun aider-prompt-insert-drop-file-path ()
+  "Select and insert file path for /drop command using fuzzy search."
+  (interactive)
+  (let* ((git-root (magit-toplevel))
+         (files (when git-root (aider--get-cached-project-files)))
+         (current-files (when files
+                          (with-current-buffer (aider--validate-aider-buffer)
+                            (save-excursion
+                              (goto-char (point-min))
+                              (let (added-files)
+                                (while (re-search-forward "^> /add \\(.*\\)$" nil t)
+                                  (push (match-string 1) added-files))
+                                added-files)))))
+         (drop-candidates (if current-files
+                              (cl-intersection files current-files :test #'string=)
+                            files))
+         (file (when drop-candidates
+                 (aider-fuzzy-select-file "Select file to drop: " git-root))))
+    (if (and file (file-exists-p file))
+        (let ((relative-path (if git-root
+                                 (file-relative-name file git-root)
+                               file)))
           (insert relative-path))
       (message "No valid file selected."))))
 
@@ -131,6 +338,8 @@ Inherits from `comint-mode' with some Aider-specific customizations.
   ;; Make history navigation variables buffer-local for multiple instance support
   (make-local-variable 'aider--history-index)
   (make-local-variable 'aider--original-input)
+  (make-local-variable 'aider--project-files-cache)
+  (make-local-variable 'aider--project-files-cache-time)
   ;; Set up font-lock
   ;; (setq font-lock-defaults '(nil t))
   ;; (font-lock-add-keywords nil aider-font-lock-keywords t)
@@ -143,13 +352,17 @@ Inherits from `comint-mode' with some Aider-specific customizations.
     (visual-line-mode 1))
   ;; Add command completion hooks
   (add-hook 'completion-at-point-functions #'aider-core--command-completion nil t)
+  (add-hook 'completion-at-point-functions #'aider-core--fuzzy-file-completion-at-point nil t)
+  (add-hook 'completion-at-point-functions #'aider-core--at-file-completion nil t)
   (add-hook 'post-self-insert-hook #'aider-core--auto-trigger-command-completion nil t)
-  ;; Automatically trigger file path insertion for file-related commands
-  (add-hook 'post-self-insert-hook #'aider-core--auto-trigger-file-path-insertion nil t)
+  ;; Automatically trigger file path insertion when '@' is typed
+  (add-hook 'post-self-insert-hook #'aider-core--auto-trigger-at-file-completion nil t)
   (add-hook 'post-self-insert-hook #'aider-core--auto-trigger-insert-prompt nil t)
   ;; only apply markdown highlighting if enabled
   (when aider-enable-markdown-highlighting
     (aider--apply-markdown-highlighting))
+  ;; Clean up old cache files periodically
+  (aider-core--cleanup-old-cache-files)
   ;; Load history from .aider.input.history if available
   (let ((history-file-path (aider--generate-history-file-name))) ; Bind history-file-path here
     (condition-case err ; catch any error during history loading
@@ -369,6 +582,39 @@ If the last character in the current line is '/', invoke `completion-at-point`."
              (eq (char-before) ?/))
     (completion-at-point)))
 
+(defun aider-core--fuzzy-file-completion-at-point ()
+  "Provide fuzzy file completion at point in aider buffer.
+Returns completion candidates for file paths when typing after file commands.
+Handles multiple spaces and tabs in command patterns."
+  (save-excursion
+    (let* ((line-start (line-beginning-position))
+           (line-end (line-end-position))
+           (line-str (buffer-substring-no-properties line-start line-end))
+           (git-root (magit-toplevel))
+           (files (when git-root (aider--get-cached-project-files))))
+      (when (and files
+                 (string-match "^[ \t]*\\(/add\\|/read-only\\|/drop\\)[ \t]+\\(.*\\)" line-str))
+        (list (+ line-start (match-beginning 2))
+              line-end
+              files
+              :exclusive 'no)))))
+
+(defun aider-core--at-file-completion ()
+  "Provide file completion when '@' is typed in aider buffer.
+Returns completion candidates for file paths when '@' is present in the line.
+Improved pattern matching for better accuracy."
+  (save-excursion
+    (let* ((line-start (line-beginning-position))
+           (line-end (line-end-position))
+           (line-str (buffer-substring-no-properties line-start line-end))
+           (git-root (magit-toplevel))
+           (files (when git-root (aider--get-cached-project-files))))
+      (when (and files (string-match "@\\([^@[:space:]]*\\)" line-str))
+        (list (+ line-start (match-beginning 1))
+              (+ line-start (match-end 1))
+              files
+              :exclusive 'no)))))
+
 (defun aider-core--auto-trigger-file-path-insertion ()
   "Automatically trigger file path insertion in aider buffer.
 If the current line matches one of the file-related commands
@@ -462,6 +708,17 @@ Cycles forward through command history with M-<down>."
         (aider--replace-input "")
         (setq aider--original-input nil)))
     (message "Not navigating history")))
+
+(defun aider-core--auto-trigger-at-file-completion ()
+  "Automatically trigger file path insertion when '@' is typed.
+If the last character typed is '@', invoke fuzzy file selection."
+  (when (and aider-auto-trigger-file-path-insertion
+             (not (minibufferp))
+             (not (bolp))
+             (eq (char-before) ?@))  ; Check if last char is '@'
+    (let ((start-pos (1- (point))))
+      (delete-char -1)  ; Remove the '@' character
+      (aider-prompt-insert-add-file-path))))
 
 (provide 'aider-core)
 

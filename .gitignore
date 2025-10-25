@@ -1,5 +1,17 @@
 .aider*
+.aider-cache/
+.aider.input.history
+*.cache
 .env
 __pycache__
+*~
+.#*
+\#*#
+*.elc
+*.el~
+auto-save-list/
 GRTAGS
 GTAGS
+.DS_Store
+Thumbs.db
+.cecli*
