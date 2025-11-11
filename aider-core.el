@@ -219,6 +219,13 @@ This is a buffer-local variable.")
   "Timestamp for the in-memory project files cache.
 This is a buffer-local variable.")
 
+;; History navigation variables
+(defvar aider--history-index nil
+  "Current index in history ring when navigating.
+Nil when not navigating history.")
+(defvar aider--original-input nil
+  "Original input before starting history navigation.")
+
 (defun aider--get-cached-project-files (&optional force-refresh)
   "Get project files, using a buffer-local in-memory cache.
 The cache expires after 60 seconds.
@@ -340,6 +347,9 @@ Inherits from `comint-mode' with some Aider-specific customizations.
   (make-local-variable 'aider--original-input)
   (make-local-variable 'aider--project-files-cache)
   (make-local-variable 'aider--project-files-cache-time)
+  ;; Make history navigation variables buffer-local for multiple instance support
+  (make-local-variable 'aider--history-index)
+  (make-local-variable 'aider--original-input)
   ;; Set up font-lock
   ;; (setq font-lock-defaults '(nil t))
   ;; (font-lock-add-keywords nil aider-font-lock-keywords t)
@@ -642,6 +652,15 @@ invoke the appropriate file path insertion function."
     (when input
       (insert input))))
 
+(defun aider--get-current-input ()
+  "Get the current input line content."
+  (buffer-substring (comint-line-beginning-position) (point-max)))
+
+(defun aider--replace-input (text)
+  "Replace current input line with TEXT."
+  (delete-region (comint-line-beginning-position) (point-max))
+  (insert text))
+
 (defun aider-core--auto-trigger-insert-prompt ()
   "Automatically trigger prompt insertion in aider buffer.
 If the current line matches one of the commands (/ask, /code, /architect),
@@ -656,14 +675,6 @@ invoke `aider-core-insert-prompt`."
       (when (string-match-p "^[ \t]*\\(/ask\\|/code\\|/architect\\) $" line-content)
         (aider-core-insert-prompt)))))
 
-(defun aider--get-current-input ()
-  "Get the current input line content."
-  (buffer-substring (comint-line-beginning-position) (point-max)))
-
-(defun aider--replace-input (text)
-  "Replace current input line with TEXT."
-  (delete-region (comint-line-beginning-position) (point-max))
-  (insert text))
 
 (defun aider-history-prev ()
   "Navigate to previous command in history.
