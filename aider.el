@@ -114,6 +114,7 @@ Also based on aider LLM benchmark: https://aider.chat/docs/leaderboards/"
   ("x" "Expand Context for Current File"          aider-expand-context-current-file)
   ("m" "Show Last Commit (C-u: magit-log)"        aider-magit-show-last-commit-or-log)
   ("u" "Undo Last Change"                         aider-undo-last-change)
+  ("S" "Commit Staged Changes"                    aider-commit-staged)
   ("v" "Pull or Review Code Change"               aider-pull-or-review-diff-file)
   ("e" "File Evolution Analysis (C-u: Repo)"      aider-magit-blame-or-log-analyze))
 

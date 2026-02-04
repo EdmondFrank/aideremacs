@@ -385,6 +385,12 @@ generate the log, save it to 'PROJECT_ROOT/git.log', open this file, and then an
         (t (aider-magit-blame-analyze))))
 
 ;;;###autoload
+(defun aider-commit-staged ()
+  "Send the command \"/commit\" to the Aider buffer to commit staged changes."
+  (interactive)
+  (aider--send-command "/commit" t))
+
+;;;###autoload
 (defun aider-magit-setup-transients ()
   "Configure Aider's transient menu entries in Magit.
 This function uses `with-eval-after-load` to ensure that the
