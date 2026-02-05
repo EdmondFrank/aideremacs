@@ -386,9 +386,12 @@ generate the log, save it to 'PROJECT_ROOT/git.log', open this file, and then an
 
 ;;;###autoload
 (defun aider-commit-staged ()
-  "Send the command \"/commit\" to the Aider buffer to commit staged changes."
+  "Instruct Aider to commit only staged changes.
+Sends a prompt asking Aider to create a commit with an appropriate message
+based on the staged changes (not unstaged changes)."
   (interactive)
-  (aider--send-command "/commit" t))
+  (let ((prompt "Please review the staged changes (git diff --cached) and create a commit with an appropriate commit message. Only commit the staged changes, do not include unstaged changes in the commit."))
+    (aider--send-command prompt t)))
 
 ;;;###autoload
 (defun aider-magit-setup-transients ()
